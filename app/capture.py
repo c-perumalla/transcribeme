@@ -63,6 +63,9 @@ async def start(session_id: str, device_name: str) -> Recorder:
     args = [
         config.FFMPEG, "-hide_banner", "-loglevel", "warning", "-y",
         "-f", "avfoundation", "-i", f":{index}",
+        # Without per-packet flushing the WAV sits in the muxer buffer, so a
+        # healthy recording can look like a dead one for several seconds.
+        "-flush_packets", "1",
         "-map", "0", "-c:a", "pcm_s16le", "-ar", "16000",
         str(directory / "full.wav"),
         "-map", "0", "-c:a", "pcm_s16le", "-ar", "16000",
@@ -95,38 +98,71 @@ async def start(session_id: str, device_name: str) -> Recorder:
 
 # A PCM WAV header is 44 bytes; anything beyond that is real audio.
 WAV_HEADER_BYTES = 44
-STARTUP_GRACE_S = 4.0
+STARTUP_GRACE_S = 8.0
 
 
 async def _confirm_audio_flowing(recorder: Recorder) -> None:
     """Fail fast if the device yields no samples.
 
-    Without this, a permission-blocked device looks like a healthy recording:
-    ffmpeg stays alive and writes nothing, so the user records a whole meeting
-    into silence and only finds out at stop. macOS is the common case — until
-    the microphone TCC grant is given, avfoundation opens the device and then
-    simply never delivers frames.
+    Without this, a silent device looks like a healthy recording: ffmpeg stays
+    alive and writes nothing, so the user records a whole meeting into silence
+    and only finds out at stop. The common macOS cause is the microphone TCC
+    grant — avfoundation opens the device and then never delivers frames — but
+    ffmpeg's own stderr is the authority, so it is included in the message.
     """
-    process, deadline = recorder.process, asyncio.get_running_loop().time() + STARTUP_GRACE_S
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + STARTUP_GRACE_S
+    process = recorder.process
 
-    while asyncio.get_running_loop().time() < deadline:
+    while loop.time() < deadline:
         if process.returncode is not None:
-            detail = " / ".join(recorder.stderr_tail[-3:]) or "ffmpeg exited immediately"
-            raise CaptureError(f"Could not open {recorder.device_name!r}: {detail}")
+            raise CaptureError(
+                f"Could not open {recorder.device_name!r}. ffmpeg said: "
+                + (_ffmpeg_detail(recorder) or "it exited immediately with no message.")
+            )
 
-        if recorder.full_wav.exists() and recorder.full_wav.stat().st_size > WAV_HEADER_BYTES:
+        if _bytes_captured(recorder) > 0:
             return
 
         await asyncio.sleep(0.25)
 
     raise CaptureError(
-        f"{recorder.device_name!r} opened but delivered no audio. On macOS this "
-        "almost always means the app running this server has not been granted "
-        "microphone access — check System Settings > Privacy & Security > "
-        "Microphone, enable the terminal (or IDE) you launched it from, then "
-        "restart the server. If permission is already granted, confirm the "
-        "device is not muted or held exclusively by another app."
+        f"{recorder.device_name!r} opened but delivered no audio in "
+        f"{STARTUP_GRACE_S:.0f}s. ffmpeg said: "
+        + (_ffmpeg_detail(recorder) or "(nothing)")
+        + " — On macOS the usual cause is the microphone permission, which "
+        "belongs to the app that LAUNCHED this server (your IDE, if you started "
+        "it from an integrated terminal — not Terminal.app). Check System "
+        "Settings > Privacy & Security > Microphone, then fully quit and "
+        "reopen that app; a running app does not pick up a new grant. Run "
+        "./diagnose_mic.sh to test ffmpeg directly."
     )
+
+
+def _bytes_captured(recorder: Recorder) -> int:
+    """Audio written so far, across both outputs.
+
+    Either output producing data proves the device is live, and the segment
+    muxer often writes before the master does.
+    """
+    total = 0
+    if recorder.full_wav.exists():
+        total += max(0, recorder.full_wav.stat().st_size - WAV_HEADER_BYTES)
+    if recorder.segment_dir.is_dir():
+        for segment in recorder.segment_dir.glob("*.wav"):
+            total += max(0, segment.stat().st_size - WAV_HEADER_BYTES)
+    return total
+
+
+def _ffmpeg_detail(recorder: Recorder) -> str:
+    """The stderr lines worth showing, minus ffmpeg's routine chatter."""
+    noise = ("Output #", "Stream mapping", "Press [q]", "encoder", "Metadata:",
+             "configuration:", "built with", "Input #", "Duration:")
+    lines = [
+        line for line in recorder.stderr_tail
+        if line and not any(line.lstrip().startswith(n) for n in noise)
+    ]
+    return " / ".join(lines[-3:])
 
 
 async def _kill(process: asyncio.subprocess.Process) -> None:
@@ -143,7 +179,7 @@ async def _drain_stderr(recorder: Recorder) -> None:
         if line:
             recorder.stderr_tail.append(line)
             del recorder.stderr_tail[:-20]
-            log.debug("ffmpeg[%s] %s", recorder.session_id, line)
+            log.info("ffmpeg[%s] %s", recorder.session_id, line)
 
 
 async def stop(session_id: str) -> Recorder:
