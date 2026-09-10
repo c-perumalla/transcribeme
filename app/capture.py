@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -91,6 +92,9 @@ async def start(session_id: str, device_name: str) -> Recorder:
     except CaptureError:
         _recorders.pop(session_id, None)
         await _kill(process)
+        # A start that never captured anything leaves only an empty WAV header
+        # and a stub segment; keeping them would strand unusable files on disk.
+        shutil.rmtree(directory, ignore_errors=True)
         raise
 
     return recorder
