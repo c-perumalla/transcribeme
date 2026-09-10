@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TranscribeMe</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header>
+  <h1>TranscribeMe</h1>
+  <span id="backend-note" class="muted"></span>
+</header>
+
+<main>
+  <section id="capture" class="panel">
+    <div class="tabs">
+      <button class="tab active" data-tab="record">Record</button>
+      <button class="tab" data-tab="upload">Upload</button>
+    </div>
+
+    <div id="tab-record" class="tabpane">
+      <label>Input device
+        <select id="device"></select>
+      </label>
+      <p id="device-hint" class="hint"></p>
+      <label>Title <input id="rec-title" placeholder="Weekly sync"></label>
+      <label>Skill <select id="rec-skill"></select></label>
+      <div class="row">
+        <button id="btn-record" class="primary">Start recording</button>
+        <button id="btn-stop" class="danger" hidden>Stop</button>
+        <span id="timer" class="timer" hidden>00:00</span>
+      </div>
+    </div>
+
+    <div id="tab-upload" class="tabpane" hidden>
+      <label>Audio file <input type="file" id="upload-file" accept="audio/*,video/mp4,video/quicktime"></label>
+      <label>Title <input id="up-title" placeholder="Optional"></label>
+      <label>Skill <select id="up-skill"></select></label>
+      <label>Known speaker count <input type="number" id="up-speakers" min="1" max="20" placeholder="auto"></label>
+      <button id="btn-upload" class="primary">Transcribe</button>
+    </div>
+  </section>
+
+  <section id="library" class="panel">
+    <h2>Sessions</h2>
+    <ul id="session-list"></ul>
+  </section>
+
+  <section id="detail" class="panel wide" hidden>
+    <div class="detail-head">
+      <h2 id="detail-title"></h2>
+      <button id="btn-close" class="ghost">Close</button>
+    </div>
+    <div id="progress-wrap" hidden>
+      <div class="bar"><div id="bar-fill"></div></div>
+      <span id="stage-label" class="muted"></span>
+    </div>
+    <p id="detail-error" class="error" hidden></p>
+    <p id="drive-note" class="hint" hidden></p>
+
+    <div class="detail-actions">
+      <select id="detail-skill"></select>
+      <button id="btn-resummarize">Re-summarize</button>
+      <span class="spacer"></span>
+      <a id="dl-bundle" class="dl">Bundle .md</a>
+      <a id="dl-summary" class="dl">Summary .md</a>
+      <a id="dl-md" class="dl">Transcript .md</a>
+      <a id="dl-txt" class="dl">.txt</a>
+      <a id="dl-srt" class="dl">.srt</a>
+      <a id="dl-json" class="dl">.json</a>
+      <button id="btn-delete" class="danger ghost">Delete</button>
+    </div>
+
+    <h3>Summary</h3>
+    <div id="summary" class="summary muted">No summary yet.</div>
+
+    <h3>Transcript <button id="btn-rename" class="ghost small">Rename speakers</button></h3>
+    <div id="transcript" class="transcript"></div>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
