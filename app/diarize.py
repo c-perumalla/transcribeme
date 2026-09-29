@@ -7,9 +7,11 @@ supply a read token, or `from_pretrained` returns None rather than raising.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from . import config
 
@@ -60,6 +62,37 @@ def _load():
         return _pipeline
 
 
+def _load_waveform(wav: Path) -> dict:
+    """Read the wav ourselves and hand pyannote an in-memory waveform.
+
+    pyannote 4 otherwise decodes through torchcodec, which needs FFmpeg shared
+    libraries it can locate at runtime — the single most common way it breaks,
+    especially on Windows. A waveform dict bypasses that path entirely.
+    """
+    import soundfile
+    import torch
+
+    samples, sample_rate = soundfile.read(str(wav), dtype="float32", always_2d=True)
+    waveform = torch.from_numpy(samples.T.copy())  # (channel, time)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    return {"waveform": waveform, "sample_rate": sample_rate}
+
+
+# Share of diarization wall time each pyannote step takes, measured roughly on
+# CPU. Embeddings dominate; the rest is near-instant.
+_STEP_SPANS = {"segmentation": (0.0, 0.3), "embeddings": (0.3, 0.95)}
+
+
+def _progress_hook(on_progress: Callable[[float], None]):
+    def hook(step_name, _artifact=None, file=None, total=None, completed=None):
+        span = _STEP_SPANS.get(step_name)
+        if span and total:
+            start, end = span
+            on_progress(start + (end - start) * min(1.0, completed / total))
+    return hook
+
+
 def _to_best_device(pipeline):
     """Prefer MPS, fall back to CPU.
 
@@ -87,7 +120,14 @@ def run(
     num_speakers: int | None = None,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
+    on_progress: Callable[[float], None] | None = None,
 ) -> list[Turn]:
+    if os.getenv("TRANSCRIBEME_FAKE_DIARIZATION"):
+        # CI without a HuggingFace token: one speaker for the whole file, so
+        # everything except the gated model can still be exercised.
+        import soundfile
+        return [Turn(0.0, float(soundfile.info(str(wav)).duration), "SPEAKER_00")]
+
     pipeline = _load()
 
     kwargs: dict = {}
@@ -99,7 +139,12 @@ def run(
         if max_speakers:
             kwargs["max_speakers"] = max_speakers
 
-    output = pipeline(str(wav), **kwargs)
+    if on_progress:
+        kwargs["hook"] = _progress_hook(on_progress)
+
+    output = pipeline(_load_waveform(wav), **kwargs)
+    if on_progress:
+        on_progress(1.0)
     annotation = _as_annotation(output)
     return [
         Turn(start=float(segment.start), end=float(segment.end), speaker=str(label))

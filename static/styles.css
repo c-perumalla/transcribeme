@@ -93,7 +93,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .dl:hover { border-color: var(--accent); color: var(--accent); }
 
 .bar { height: 5px; background: var(--line); border-radius: 3px; overflow: hidden; }
-#bar-fill { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+#bar-fill, .fill { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
 #progress-wrap { margin: 10px 0; }
 
 .summary { white-space: pre-wrap; }
@@ -107,3 +107,28 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   background: var(--accent-soft); color: var(--accent);
   padding: 1px 5px; border-radius: 3px; margin-left: 6px;
 }
+
+label.check { display: flex; align-items: center; gap: 8px; color: var(--ink); }
+label.check input { width: auto; margin: 0; }
+code { font-size: 12px; background: var(--bg); padding: 1px 4px; border-radius: 3px; }
+
+.batch-folder { font-size: 13px; margin: -4px 0 10px; word-break: break-all; }
+.batch-summary { font-size: 13px; margin: 8px 0 14px; font-variant-numeric: tabular-nums; }
+.batch-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.batch-table th {
+  text-align: left; font-weight: 500; color: var(--muted);
+  border-bottom: 1px solid var(--line); padding: 6px 8px;
+}
+.batch-table td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.batch-table td.file { word-break: break-all; }
+.batch-table td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.batch-table .w-bar { width: 22%; }
+.batch-table .err { color: var(--danger); font-size: 12px; }
+.batch-table tr.running { background: var(--accent-soft); }
+.pill {
+  font-size: 11px; padding: 1px 7px; border-radius: 9px; white-space: nowrap;
+  background: var(--bg); color: var(--muted); border: 1px solid var(--line);
+}
+.pill.done { color: var(--ok); border-color: var(--ok); }
+.pill.running { color: var(--accent); border-color: var(--accent); }
+.pill.error { color: var(--danger); border-color: var(--danger); }

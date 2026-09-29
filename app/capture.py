@@ -1,4 +1,4 @@
-"""Live audio capture through ffmpeg's avfoundation input.
+"""Live audio capture through ffmpeg (avfoundation on macOS, dshow on Windows).
 
 One ffmpeg process, one input, two outputs:
 
@@ -6,8 +6,10 @@ One ffmpeg process, one input, two outputs:
   seg/%05d.wav  short segments the live transcriber consumes
 
 Two outputs from one process avoids tailing a growing file, and guarantees the
-live text and the master come from exactly the same audio. Channel count is
-preserved (no `-ac`) because the aggregate-device split depends on it.
+live text and the master come from exactly the same audio. On macOS the channel
+count is preserved (no `-ac`) because the aggregate-device split depends on it.
+On Windows it is forced to mono: DirectShow usually reports a mono microphone as
+stereo, and a two-channel file would be split into bogus "me"/"them" tracks.
 """
 
 from __future__ import annotations
@@ -55,7 +57,8 @@ async def start(session_id: str, device_name: str) -> Recorder:
     if session_id in _recorders:
         raise CaptureError("This session is already recording.")
 
-    index = devices.resolve(device_name)  # resolve by name; indexes shift
+    input_args = devices.input_args(device_name)  # re-resolved; indexes shift
+    channel_args = ["-ac", "1"] if config.IS_WINDOWS else []
 
     directory = config.SESSIONS_DIR / session_id
     segment_dir = directory / "seg"
@@ -63,19 +66,19 @@ async def start(session_id: str, device_name: str) -> Recorder:
 
     args = [
         config.FFMPEG, "-hide_banner", "-loglevel", "warning", "-y",
-        "-f", "avfoundation", "-i", f":{index}",
+        *input_args,
         # Without per-packet flushing the WAV sits in the muxer buffer, so a
         # healthy recording can look like a dead one for several seconds.
         "-flush_packets", "1",
-        "-map", "0", "-c:a", "pcm_s16le", "-ar", "16000",
+        "-map", "0", "-c:a", "pcm_s16le", "-ar", "16000", *channel_args,
         str(directory / "full.wav"),
-        "-map", "0", "-c:a", "pcm_s16le", "-ar", "16000",
+        "-map", "0", "-c:a", "pcm_s16le", "-ar", "16000", *channel_args,
         "-f", "segment", "-segment_time", str(config.SEGMENT_SECONDS),
         str(segment_dir / "%05d.wav"),
     ]
     # stdin stays open (no -nostdin) so stop() can send 'q'.
 
-    log.info("Starting capture for %s on %r (index %d)", session_id, device_name, index)
+    log.info("Starting capture for %s on %r", session_id, device_name)
     process = await asyncio.create_subprocess_exec(
         *args,
         stdin=asyncio.subprocess.PIPE,
@@ -134,13 +137,23 @@ async def _confirm_audio_flowing(recorder: Recorder) -> None:
         f"{recorder.device_name!r} opened but delivered no audio in "
         f"{STARTUP_GRACE_S:.0f}s. ffmpeg said: "
         + (_ffmpeg_detail(recorder) or "(nothing)")
-        + " — On macOS the usual cause is the microphone permission, which "
-        "belongs to the app that LAUNCHED this server (your IDE, if you started "
-        "it from an integrated terminal — not Terminal.app). Check System "
-        "Settings > Privacy & Security > Microphone, then fully quit and "
-        "reopen that app; a running app does not pick up a new grant. Run "
-        "./diagnose_mic.sh to test ffmpeg directly."
+        + " — " + _PERMISSION_HINT
     )
+
+
+_PERMISSION_HINT = (
+    "On Windows the usual cause is microphone privacy: open Settings > Privacy "
+    "& security > Microphone and turn on both 'Microphone access' and 'Let "
+    "desktop apps access your microphone'. Run `uv run transcribeme doctor --mic` to "
+    "test ffmpeg directly."
+    if config.IS_WINDOWS else
+    "On macOS the usual cause is the microphone permission, which belongs to "
+    "the app that LAUNCHED this server (your IDE, if you started it from an "
+    "integrated terminal — not Terminal.app). Check System Settings > Privacy "
+    "& Security > Microphone, then fully quit and reopen that app; a running "
+    "app does not pick up a new grant. Run `uv run transcribeme doctor --mic` to test "
+    "ffmpeg directly."
+)
 
 
 def _bytes_captured(recorder: Recorder) -> int:

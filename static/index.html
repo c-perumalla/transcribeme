@@ -17,6 +17,7 @@
     <div class="tabs">
       <button class="tab active" data-tab="record">Record</button>
       <button class="tab" data-tab="upload">Upload</button>
+      <button class="tab" data-tab="folder">Folder</button>
     </div>
 
     <div id="tab-record" class="tabpane">
@@ -34,12 +35,41 @@
     </div>
 
     <div id="tab-upload" class="tabpane" hidden>
-      <label>Audio file <input type="file" id="upload-file" accept="audio/*,video/mp4,video/quicktime"></label>
+      <label>Audio or video file <input type="file" id="upload-file" accept="audio/*,video/*,.mkv,.wmv,.mts,.m2ts"></label>
       <label>Title <input id="up-title" placeholder="Optional"></label>
       <label>Skill <select id="up-skill"></select></label>
       <label>Known speaker count <input type="number" id="up-speakers" min="1" max="20" placeholder="auto"></label>
       <button id="btn-upload" class="primary">Transcribe</button>
     </div>
+
+    <div id="tab-folder" class="tabpane" hidden>
+      <label>Folder path <input id="batch-folder" placeholder="D:\Recordings  or  ~/Movies/calls"></label>
+      <label class="check"><input type="checkbox" id="batch-recursive"> Include subfolders</label>
+      <label>Skill <select id="batch-skill"></select></label>
+      <label>Known speaker count <input type="number" id="batch-speakers" min="1" max="20" placeholder="auto"></label>
+      <label class="check"><input type="checkbox" id="batch-force"> Re-process files that already have transcripts</label>
+      <p class="hint">Every audio and video file is transcribed in turn. Results go to a
+        <code>transcripts</code> folder inside it, and files that already have results
+        are skipped, so you can re-run to resume.</p>
+      <button id="btn-batch" class="primary">Transcribe folder</button>
+    </div>
+  </section>
+
+  <section id="batch" class="panel wide" hidden>
+    <div class="detail-head">
+      <h2>Folder batch</h2>
+      <span>
+        <button id="btn-batch-cancel" class="danger ghost">Cancel remaining</button>
+        <button id="btn-batch-close" class="ghost">Close</button>
+      </span>
+    </div>
+    <p id="batch-folder-label" class="muted batch-folder"></p>
+    <div class="bar"><div id="batch-bar-fill" class="fill"></div></div>
+    <p id="batch-summary" class="batch-summary"></p>
+    <table class="batch-table">
+      <thead><tr><th>File</th><th>Length</th><th>Status</th><th class="w-bar">Progress</th><th></th></tr></thead>
+      <tbody id="batch-rows"></tbody>
+    </table>
   </section>
 
   <section id="library" class="panel">

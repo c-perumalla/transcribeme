@@ -10,17 +10,50 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Callable
 
 from . import align, asr, audio, config, db, delivery, diarize, events, summarize
 
 log = logging.getLogger(__name__)
 
 
+ProgressFn = Callable[[str, float, str], None]
+
+
+class _Reporter:
+    """Fans stage progress out to SQLite, the SSE stream, and an optional
+    callback (the CLI's progress bars).
+
+    Sub-stage updates from Whisper and pyannote arrive many times a second on
+    long files, so persisting is throttled to whole-percent changes.
+    """
+
+    def __init__(self, session_id: str, callback: ProgressFn | None) -> None:
+        self.session_id = session_id
+        self.callback = callback
+        self._last_saved = -1.0
+
+    def stage(self, stage: str, progress: float, note: str = "") -> None:
+        if self.callback:
+            self.callback(stage, progress, note)
+        if abs(progress - self._last_saved) < 0.01 and progress < 1.0:
+            return
+        self._last_saved = progress
+        db.set_stage(self.session_id, stage, progress)
+        events.publish(self.session_id, {
+            "type": "stage", "stage": stage, "progress": progress, "note": note,
+        })
+
+    def span(self, stage: str, start: float, end: float, note: str = ""):
+        """A 0-1 callback mapped onto [start, end] of the overall bar."""
+        self.stage(stage, start, note)
+        return lambda fraction: self.stage(
+            stage, start + (end - start) * fraction, note
+        )
+
+
 def _stage(session_id: str, stage: str, progress: float, note: str = "") -> None:
-    db.set_stage(session_id, stage, progress)
-    events.publish(session_id, {
-        "type": "stage", "stage": stage, "progress": progress, "note": note,
-    })
+    _Reporter(session_id, None).stage(stage, progress, note)
 
 
 def process(
@@ -31,17 +64,40 @@ def process(
     num_speakers: int | None = None,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
-) -> None:
+    dual_channel: bool = False,
+    deliver: bool = True,
+    progress: ProgressFn | None = None,
+) -> bool:
+    """Run the pipeline; return True on success. Failures are recorded on the
+    session rather than raised, so one bad file never takes down a batch."""
     try:
         _process(
             session_id, source_audio, skill_id=skill_id,
             num_speakers=num_speakers, min_speakers=min_speakers,
-            max_speakers=max_speakers,
+            max_speakers=max_speakers, dual_channel=dual_channel,
+            deliver=deliver, reporter=_Reporter(session_id, progress),
         )
+        return True
     except Exception as exc:
         log.exception("Pipeline failed for %s", session_id)
         db.fail(session_id, str(exc))
         events.publish(session_id, {"type": "error", "message": str(exc)})
+        return False
+
+
+def _prepare_tracks(source_audio: Path, work_dir: Path, dual_channel: bool,
+                    info: dict) -> dict[str, Path]:
+    """Only live captures carry a meaningful mic/far-end channel split. Any
+    file source — a stereo MP3, a 5.1 movie — is downmixed and diarized."""
+    if dual_channel:
+        return audio.split_channels(source_audio, work_dir / "tracks")
+    already_prepared = (
+        source_audio.suffix.lower() == ".wav"
+        and info["channels"] == 1 and info["sample_rate"] == 16000
+    )
+    if already_prepared:
+        return {"mixed": source_audio}
+    return {"mixed": audio.normalize(source_audio, work_dir / "tracks" / "mixed.wav")}
 
 
 def _process(
@@ -52,36 +108,38 @@ def _process(
     num_speakers: int | None,
     min_speakers: int | None,
     max_speakers: int | None,
+    dual_channel: bool,
+    deliver: bool,
+    reporter: _Reporter,
 ) -> None:
     work_dir = source_audio.parent
     db.update(session_id, status="processing", error=None)
+    speakers = dict(num_speakers=num_speakers, min_speakers=min_speakers,
+                    max_speakers=max_speakers)
 
     # 1. Probe and split -------------------------------------------------
-    _stage(session_id, "normalizing", 0.05)
+    reporter.stage("normalizing", 0.02)
     info = audio.probe(source_audio)
     db.update(
         session_id, duration_s=info["duration_s"], channels=info["channels"]
     )
-    tracks = audio.split_channels(source_audio, work_dir / "tracks")
+    tracks = _prepare_tracks(source_audio, work_dir, dual_channel, info)
     dual = "me" in tracks and "them" in tracks
 
     # 2. Transcribe ------------------------------------------------------
-    _stage(session_id, "transcribing", 0.15,
-           "dual-channel" if dual else "single channel")
-
     all_utterances: list[dict] = []
 
     if dual:
         # The mic track is physically separated, so it needs no diarization —
         # unless several people share the mic in an in-person meeting.
-        me_words = asr.transcribe(tracks["me"], channel="me")
-        _stage(session_id, "transcribing", 0.40, "far-end channel")
-        them_words = asr.transcribe(tracks["them"], channel="them")
+        me_words = asr.transcribe(tracks["me"], channel="me", on_progress=reporter.span(
+            "transcribing", 0.05, 0.30, "your channel"))
+        them_words = asr.transcribe(tracks["them"], channel="them", on_progress=reporter.span(
+            "transcribing", 0.30, 0.55, "far-end channel"))
 
-        _stage(session_id, "diarizing", 0.65, "separating remote speakers")
         them_turns = diarize.run(
-            tracks["them"], num_speakers=num_speakers,
-            min_speakers=min_speakers, max_speakers=max_speakers,
+            tracks["them"], **speakers, on_progress=reporter.span(
+                "diarizing", 0.55, 0.85, "separating remote speakers"),
         ) if them_words else []
 
         if config.DIARIZE_MIC_CHANNEL and me_words:
@@ -95,19 +153,19 @@ def _process(
 
         them_labelled = align.assign_speakers(them_words, them_turns)
 
-        _stage(session_id, "aligning", 0.80)
+        reporter.stage("aligning", 0.86)
         all_utterances = align.merge_timelines(
             align.to_utterances(me_labelled),
             align.to_utterances(them_labelled),
         )
     else:
-        words = asr.transcribe(tracks["mixed"], channel="mixed")
-        _stage(session_id, "diarizing", 0.60)
+        words = asr.transcribe(tracks["mixed"], channel="mixed", on_progress=reporter.span(
+            "transcribing", 0.05, 0.55))
         turns = diarize.run(
-            tracks["mixed"], num_speakers=num_speakers,
-            min_speakers=min_speakers, max_speakers=max_speakers,
+            tracks["mixed"], **speakers,
+            on_progress=reporter.span("diarizing", 0.55, 0.85),
         ) if words else []
-        _stage(session_id, "aligning", 0.80)
+        reporter.stage("aligning", 0.86)
         all_utterances = align.to_utterances(align.assign_speakers(words, turns))
 
     for utterance in all_utterances:
@@ -119,24 +177,29 @@ def _process(
     if not all_utterances:
         db.update(session_id, status="done", stage="complete", progress=1.0,
                   error="No speech detected in this recording.")
+        reporter.stage("complete", 1.0)
         events.publish(session_id, {"type": "done"})
         return
 
     # 3. Summarize -------------------------------------------------------
     if skill_id:
-        _stage(session_id, "summarizing", 0.88, f"skill: {skill_id}")
+        reporter.stage("summarizing", 0.88, f"skill: {skill_id}")
         session = db.get(session_id)
         summary = summarize.run(session, all_utterances, skill_id)
         db.update(session_id, summary_md=summary, skill_name=skill_id)
         events.publish(session_id, {"type": "summary", "markdown": summary})
 
     # 4. Deliver ---------------------------------------------------------
-    _stage(session_id, "delivering", 0.96)
-    session = db.get(session_id)
-    drive_path = delivery.write(session, all_utterances)
-    db.update(session_id, drive_path=drive_path)
+    if deliver:
+        reporter.stage("delivering", 0.96)
+        session = db.get(session_id)
+        drive_path = delivery.write(session, all_utterances)
+        db.update(session_id, drive_path=drive_path)
+    else:
+        drive_path = None
 
     db.update(session_id, status="done", stage="complete", progress=1.0)
+    reporter.stage("complete", 1.0)
     events.publish(session_id, {"type": "done", "drive_path": drive_path})
     log.info("Session %s complete (%d utterances)", session_id, len(all_utterances))
 

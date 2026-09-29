@@ -34,6 +34,30 @@ CREATE TABLE IF NOT EXISTS sessions (
     summary_md         TEXT,
     drive_path         TEXT
 );
+
+CREATE TABLE IF NOT EXISTS batches (
+    id           TEXT PRIMARY KEY,
+    folder       TEXT NOT NULL,
+    options_json TEXT NOT NULL,
+    origin       TEXT NOT NULL,                -- 'web' | 'cli'
+    created_at   TEXT NOT NULL,
+    finished_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS batch_items (
+    batch_id     TEXT NOT NULL,
+    position     INTEGER NOT NULL,
+    path         TEXT NOT NULL,
+    rel_path     TEXT NOT NULL,
+    duration_s   REAL,
+    status       TEXT NOT NULL,     -- queued|running|done|skipped|error|cancelled
+    session_id   TEXT,
+    outputs_json TEXT,
+    error        TEXT,
+    started_at   TEXT,
+    finished_at  TEXT,
+    PRIMARY KEY (batch_id, position)
+);
 """
 
 
@@ -102,7 +126,7 @@ def get(sid: str) -> dict[str, Any] | None:
     return _hydrate(row) if row else None
 
 
-def list_sessions(limit: int = 200) -> list[dict[str, Any]]:
+def list_sessions(limit: int = 500) -> list[dict[str, Any]]:
     rows = _conn().execute(
         """SELECT id, title, created_at, source, duration_s, status, stage,
                   progress, error, speaker_count, skill_name, drive_path
@@ -137,3 +161,107 @@ def save_utterances(sid: str, utterances: list[dict[str, Any]]) -> None:
 
 def save_speaker_names(sid: str, names: dict[str, str]) -> None:
     update(sid, speaker_names_json=json.dumps(names, ensure_ascii=False))
+
+
+# --- Batches ----------------------------------------------------------------
+
+def create_batch(folder: str, options: dict[str, Any], origin: str,
+                 items: list[dict[str, Any]]) -> str:
+    bid = uuid.uuid4().hex[:12]
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO batches (id, folder, options_json, origin, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (bid, folder, json.dumps(options), origin, _now()),
+    )
+    conn.executemany(
+        """INSERT INTO batch_items
+           (batch_id, position, path, rel_path, duration_s, status, outputs_json, error)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        [
+            (bid, i, item["path"], item["rel_path"], item.get("duration_s"),
+             item["status"], json.dumps(item.get("outputs") or {}), item.get("error"))
+            for i, item in enumerate(items)
+        ],
+    )
+    conn.commit()
+    return bid
+
+
+def update_batch_item(bid: str, position: int, **fields: Any) -> None:
+    if "outputs" in fields:
+        fields["outputs_json"] = json.dumps(fields.pop("outputs"))
+    for stamp in ("started_at", "finished_at"):
+        if fields.get(stamp) is True:
+            fields[stamp] = _now()
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    _conn().execute(
+        f"UPDATE batch_items SET {cols} WHERE batch_id = ? AND position = ?",
+        (*fields.values(), bid, position),
+    )
+    _conn().commit()
+
+
+def finish_batch(bid: str) -> None:
+    _conn().execute("UPDATE batches SET finished_at = ? WHERE id = ?", (_now(), bid))
+    _conn().commit()
+
+
+def cancel_queued(bid: str) -> int:
+    cur = _conn().execute(
+        "UPDATE batch_items SET status = 'cancelled' "
+        "WHERE batch_id = ? AND status = 'queued'", (bid,),
+    )
+    _conn().commit()
+    return cur.rowcount
+
+
+def get_batch(bid: str) -> dict[str, Any] | None:
+    row = _conn().execute("SELECT * FROM batches WHERE id = ?", (bid,)).fetchone()
+    if not row:
+        return None
+    batch = dict(row)
+    batch["options"] = json.loads(batch.pop("options_json"))
+    # Live stage/progress come from the session each item spawned.
+    rows = _conn().execute(
+        """SELECT i.*, s.stage, s.progress
+           FROM batch_items i LEFT JOIN sessions s ON s.id = i.session_id
+           WHERE i.batch_id = ? ORDER BY i.position""",
+        (bid,),
+    ).fetchall()
+    items = []
+    for r in rows:
+        item = dict(r)
+        item["outputs"] = json.loads(item.pop("outputs_json") or "{}")
+        items.append(item)
+    batch["items"] = items
+    return batch
+
+
+def get_batch_item(bid: str, position: int) -> dict[str, Any] | None:
+    row = _conn().execute(
+        "SELECT * FROM batch_items WHERE batch_id = ? AND position = ?",
+        (bid, position),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def latest_batch_id() -> str | None:
+    row = _conn().execute(
+        "SELECT id FROM batches WHERE origin = 'web' ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def abandon_web_batches() -> None:
+    """A server restart drops the in-memory job queue; reflect that honestly
+    instead of leaving items 'queued' forever. CLI batches run in their own
+    process and are left alone."""
+    conn = _conn()
+    web = "(SELECT id FROM batches WHERE origin = 'web')"
+    conn.execute(f"UPDATE batch_items SET status = 'cancelled' "
+                 f"WHERE status = 'queued' AND batch_id IN {web}")
+    conn.execute(f"UPDATE batch_items SET status = 'error', "
+                 f"error = 'Interrupted by a server restart' "
+                 f"WHERE status = 'running' AND batch_id IN {web}")
+    conn.commit()

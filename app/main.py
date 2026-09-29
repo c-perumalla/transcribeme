@@ -14,8 +14,10 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
-from . import (capture, config, db, delivery, devices, events, formats, jobs,
-               live, skills)
+from pydantic import BaseModel
+
+from . import (audio, batch, capture, config, db, delivery, devices, events,
+               formats, jobs, live, skills, worker)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,17 +29,22 @@ app = FastAPI(title="TranscribeMe")
 
 _live_transcribers: dict[str, live.LiveTranscriber] = {}
 
-AUDIO_SUFFIXES = {
-    ".wav", ".mp3", ".m4a", ".mp4", ".aac", ".flac", ".ogg", ".opus",
-    ".webm", ".aiff", ".aif", ".caf", ".mov",
-}
-
 
 @app.on_event("startup")
 def _startup() -> None:
     config.ensure_dirs()
     db.init()
-    log.info("ASR backend: %s | Drive folder: %s", config.ASR_BACKEND, config.DRIVE_DIR)
+    db.abandon_web_batches()
+    log.info("ASR backend: %s | ffmpeg: %s | Drive folder: %s",
+             config.ASR_BACKEND, config.FFMPEG, config.DRIVE_DIR)
+
+
+@app.get("/api/info")
+def api_info():
+    return {
+        "platform": "windows" if config.IS_WINDOWS else "mac" if config.IS_MAC else "other",
+        "asr_backend": config.ASR_BACKEND,
+    }
 
 
 # --- Devices & skills -----------------------------------------------------
@@ -83,7 +90,7 @@ async def start_recording(
 
 
 @app.post("/api/recordings/{session_id}/stop")
-async def stop_recording(session_id: str, background: BackgroundTasks):
+async def stop_recording(session_id: str):
     try:
         recorder = await capture.stop(session_id)
     except capture.CaptureError as exc:
@@ -96,9 +103,9 @@ async def stop_recording(session_id: str, background: BackgroundTasks):
 
     session = db.get(session_id)
     db.update(session_id, status="processing", stage="queued", progress=0.0)
-    background.add_task(
-        _run_pipeline, session_id, recorder.full_wav, session["skill_name"]
-    )
+    # Only a live capture has a meaningful mic / far-end channel split.
+    worker.submit(session_id, jobs.process, session_id, recorder.full_wav,
+                  skill_id=session["skill_name"], dual_channel=True)
     return {"id": session_id, "status": "processing"}
 
 
@@ -106,18 +113,17 @@ async def stop_recording(session_id: str, background: BackgroundTasks):
 
 @app.post("/api/sessions")
 async def create_from_upload(
-    background: BackgroundTasks,
     file: UploadFile = File(...),
     title: str = Form(""),
     skill: str = Form(""),
     num_speakers: int | None = Form(None),
 ):
     suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in AUDIO_SUFFIXES:
+    if suffix not in audio.MEDIA_SUFFIXES:
         raise HTTPException(
             400,
             f"Unsupported file type {suffix or '(none)'}. Expected one of: "
-            + ", ".join(sorted(AUDIO_SUFFIXES)),
+            + ", ".join(sorted(audio.MEDIA_SUFFIXES)),
         )
 
     title = title.strip() or Path(file.filename or "Upload").stem
@@ -131,26 +137,92 @@ async def create_from_upload(
     with destination.open("wb") as handle:
         shutil.copyfileobj(file.file, handle)
 
-    background.add_task(
-        _run_pipeline, session_id, destination, skill or None, num_speakers
-    )
+    worker.submit(session_id, _process_upload, session_id, destination,
+                  skill or None, num_speakers)
     return {"id": session_id, "title": title, "status": "processing"}
 
 
-def _run_pipeline(
-    session_id: str,
-    source: Path,
-    skill_id: str | None,
-    num_speakers: int | None = None,
-) -> None:
-    jobs.process(session_id, source, skill_id=skill_id, num_speakers=num_speakers)
+def _process_upload(session_id: str, source: Path, skill_id: str | None,
+                    num_speakers: int | None) -> None:
+    """Extract the audio track, then run the diarized (single-channel) path.
+
+    An uploaded video is deleted once its audio is out — the session keeps
+    audio.wav, and a multi-GB copy of a video the user still has is dead weight.
+    """
+    db.set_stage(session_id, "extracting audio", 0.0)
+    wav = source.with_name("audio.wav")
+    try:
+        audio.extract(source, wav)
+    except audio.AudioError as exc:
+        db.fail(session_id, str(exc))
+        events.publish(session_id, {"type": "error", "message": str(exc)})
+        return
+    if audio.is_video(source):
+        source.unlink(missing_ok=True)
+    jobs.process(session_id, wav, skill_id=skill_id, num_speakers=num_speakers)
+
+
+# --- Folder batches -------------------------------------------------------
+
+class BatchRequest(BaseModel):
+    folder: str
+    recursive: bool = False
+    skill: str | None = None
+    num_speakers: int | None = None
+    formats: list[str] = list(batch.DEFAULT_FORMATS)
+    force: bool = False
+
+
+@app.post("/api/batches")
+def api_create_batch(req: BatchRequest):
+    # Plain `def`: scanning and probing a large folder blocks, so FastAPI runs
+    # this in its thread pool rather than on the event loop.
+    try:
+        opts = batch.Options(
+            folder=Path(req.folder.strip().strip('"')), recursive=req.recursive,
+            skill=req.skill or None, num_speakers=req.num_speakers,
+            formats=tuple(req.formats), force=req.force,
+        )
+        bid = batch.create(opts, origin="web")
+    except batch.BatchError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    batch.enqueue(bid)
+    return _batch_view(bid)
+
+
+@app.get("/api/batches/latest")
+def api_latest_batch():
+    bid = db.latest_batch_id()
+    return _batch_view(bid) if bid else {"batch": None}
+
+
+@app.get("/api/batches/{bid}")
+def api_get_batch(bid: str):
+    return _batch_view(bid)
+
+
+@app.post("/api/batches/{bid}/cancel")
+def api_cancel_batch(bid: str):
+    if not db.get_batch(bid):
+        raise HTTPException(404, "No such batch")
+    return {"cancelled": db.cancel_queued(bid), **_batch_view(bid)}
+
+
+def _batch_view(bid: str) -> dict:
+    data = db.get_batch(bid)
+    if not data:
+        raise HTTPException(404, "No such batch")
+    return {"batch": data, "stats": batch.stats(data).__dict__}
 
 
 # --- Sessions -------------------------------------------------------------
 
 @app.get("/api/sessions")
 def api_list_sessions():
-    return {"sessions": db.list_sessions()}
+    sessions = db.list_sessions()
+    for session in sessions:
+        session["queue_position"] = worker.position(session["id"])
+    return {"sessions": sessions}
 
 
 @app.get("/api/sessions/{session_id}")
@@ -267,8 +339,9 @@ def api_download(session_id: str, kind: str = "bundle", fmt: str = "md"):
 @app.get("/api/sessions/{session_id}/audio")
 def api_audio(session_id: str):
     directory = config.SESSIONS_DIR / session_id
-    for candidate in sorted(directory.glob("full.wav")) + sorted(directory.glob("source.*")):
-        return FileResponse(candidate)
+    for pattern in ("full.wav", "audio.wav", "source.*"):
+        for candidate in sorted(directory.glob(pattern)):
+            return FileResponse(candidate)
     raise HTTPException(404, "No audio stored for this session")
 
 

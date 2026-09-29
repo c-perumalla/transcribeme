@@ -15,6 +15,7 @@ import logging
 import threading
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from typing import Callable
 
 from . import config
 
@@ -45,17 +46,22 @@ def transcribe(
     channel: str = "mixed",
     offset: float = 0.0,
     initial_prompt: str | None = None,
+    on_progress: Callable[[float], None] | None = None,
 ) -> list[Word]:
     """Transcribe a 16 kHz mono wav into word-level timings.
 
     `offset` shifts every timestamp, which is what lets live segments report
     times on the whole-session timeline instead of restarting at zero.
+    `on_progress` receives the fraction of audio covered so far (0-1); only
+    faster-whisper reports it incrementally, mlx reports once at the end.
     """
     backend = config.ASR_BACKEND
     if backend == "mlx":
         words = _transcribe_mlx(wav, initial_prompt)
+        if on_progress:
+            on_progress(1.0)
     elif backend == "faster_whisper":
-        words = _transcribe_faster(wav, initial_prompt)
+        words = _transcribe_faster(wav, initial_prompt, on_progress)
     else:
         raise ASRError(
             f"Unknown ASR_BACKEND {backend!r}. Use 'mlx' or 'faster_whisper'."
@@ -91,7 +97,11 @@ def _transcribe_mlx(wav: Path, initial_prompt: str | None) -> list[tuple]:
     return out
 
 
-def _transcribe_faster(wav: Path, initial_prompt: str | None) -> list[tuple]:
+def _transcribe_faster(
+    wav: Path,
+    initial_prompt: str | None,
+    on_progress: Callable[[float], None] | None,
+) -> list[tuple]:
     global _faster_model
     try:
         from faster_whisper import WhisperModel
@@ -100,16 +110,23 @@ def _transcribe_faster(wav: Path, initial_prompt: str | None) -> list[tuple]:
 
     with _model_lock:
         if _faster_model is None:
-            log.info("Loading faster-whisper %s (CPU)", config.FASTER_WHISPER_MODEL)
+            log.info("Loading faster-whisper %s (CPU, %d threads)",
+                     config.FASTER_WHISPER_MODEL, config.CPU_THREADS)
             _faster_model = WhisperModel(
-                config.FASTER_WHISPER_MODEL, device="cpu", compute_type="int8"
+                config.FASTER_WHISPER_MODEL, device="cpu", compute_type="int8",
+                cpu_threads=config.CPU_THREADS,
             )
 
-    segments, _info = _faster_model.transcribe(
+    # `segments` is a lazy generator: decoding happens as it is consumed, so
+    # each yielded segment's end time is real progress through the file.
+    segments, info = _faster_model.transcribe(
         str(wav), word_timestamps=True, initial_prompt=initial_prompt
     )
+    duration = float(info.duration or 0.0)
     out: list[tuple] = []
     for segment in segments:
+        if on_progress and duration > 0:
+            on_progress(min(1.0, float(segment.end) / duration))
         for word in segment.words or []:
             text = (word.word or "").strip()
             if text:

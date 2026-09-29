@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import os
+import platform
+import shutil
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
+
+IS_WINDOWS = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+IS_APPLE_SILICON = IS_MAC and platform.machine() == "arm64"
+
+# Without Developer Mode, Windows cannot create the symlinks the HF cache
+# prefers; it falls back to copies, which is fine, but warns on every load.
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
 def _bool(name: str, default: bool = False) -> bool:
@@ -30,9 +41,14 @@ DIARIZATION_MODEL = os.getenv(
 )
 
 # ASR
-ASR_BACKEND = os.getenv("ASR_BACKEND", "mlx").strip().lower()
+# 'auto' picks mlx where Metal exists and faster-whisper everywhere else.
+ASR_BACKEND = os.getenv("ASR_BACKEND", "auto").strip().lower()
+if ASR_BACKEND == "auto":
+    ASR_BACKEND = "mlx" if IS_APPLE_SILICON else "faster_whisper"
 MLX_WHISPER_MODEL = os.getenv("MLX_WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")
 FASTER_WHISPER_MODEL = os.getenv("FASTER_WHISPER_MODEL", "large-v3-turbo")
+# CTranslate2 defaults to 4 threads; on a CPU-only machine every core counts.
+CPU_THREADS = int(os.getenv("CPU_THREADS") or 0) or (os.cpu_count() or 4)
 
 # Capture
 SEGMENT_SECONDS = int(os.getenv("SEGMENT_SECONDS", "15"))
@@ -45,14 +61,47 @@ SESSIONS_DIR = DATA_DIR / "sessions"
 DB_PATH = DATA_DIR / "transcribeme.db"
 SKILLS_DIR = _path("SKILLS_DIR", str(ROOT / "skills"))
 STATIC_DIR = ROOT / "static"
-DRIVE_DIR = _path("DRIVE_DIR", "~/Google Drive/My Drive/TranscribeMe")
+# Drive for Desktop mounts as G: on Windows by default.
+DRIVE_DIR = _path(
+    "DRIVE_DIR",
+    "G:/My Drive/TranscribeMe" if IS_WINDOWS else "~/Google Drive/My Drive/TranscribeMe",
+)
 
 # Server
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
 
-FFMPEG = os.getenv("FFMPEG", "ffmpeg")
-FFPROBE = os.getenv("FFPROBE", "ffprobe")
+# setup.ps1 unpacks a pinned ffmpeg here, so Windows needs nothing on PATH.
+BUNDLED_FFMPEG_BIN = ROOT / ".tools" / "ffmpeg" / "bin"
+
+
+def _tool(name: str) -> str:
+    """Resolve ffmpeg/ffprobe: env var, then the bundled build, then PATH."""
+    explicit = os.getenv(name.upper())
+    if explicit:
+        return explicit
+    bundled = BUNDLED_FFMPEG_BIN / (name + (".exe" if IS_WINDOWS else ""))
+    if bundled.is_file():
+        return str(bundled)
+    return shutil.which(name) or name
+
+
+def _expose_bundled_ffmpeg() -> None:
+    """Make the bundled ffmpeg DLLs loadable by torchcodec (a pyannote dep).
+
+    Python 3.8+ on Windows no longer searches PATH for extension-module DLLs,
+    so the directory has to be registered explicitly as well.
+    """
+    if not BUNDLED_FFMPEG_BIN.is_dir():
+        return
+    os.environ["PATH"] = str(BUNDLED_FFMPEG_BIN) + os.pathsep + os.environ.get("PATH", "")
+    if IS_WINDOWS:
+        os.add_dll_directory(str(BUNDLED_FFMPEG_BIN))
+
+
+_expose_bundled_ffmpeg()
+FFMPEG = _tool("ffmpeg")
+FFPROBE = _tool("ffprobe")
 
 # Gap between words that forces a new utterance, in seconds.
 UTTERANCE_GAP_S = float(os.getenv("UTTERANCE_GAP_S", "1.5"))

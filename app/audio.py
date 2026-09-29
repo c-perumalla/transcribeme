@@ -9,12 +9,31 @@ from pathlib import Path
 from . import config
 
 
+AUDIO_SUFFIXES = {
+    ".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".aiff", ".aif",
+    ".caf", ".wma",
+}
+VIDEO_SUFFIXES = {
+    ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".wmv", ".mpg", ".mpeg",
+    ".ts", ".mts", ".m2ts", ".flv", ".3gp",
+}
+MEDIA_SUFFIXES = AUDIO_SUFFIXES | VIDEO_SUFFIXES
+
+
 class AudioError(RuntimeError):
     pass
 
 
+def is_video(path: Path) -> bool:
+    return path.suffix.lower() in VIDEO_SUFFIXES
+
+
 def _run(args: list[str]) -> str:
-    proc = subprocess.run(args, capture_output=True, text=True)
+    # Explicit UTF-8: the Windows default code page chokes on non-ASCII paths
+    # and device names in ffmpeg's output.
+    proc = subprocess.run(
+        args, capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
     if proc.returncode != 0:
         tail = proc.stderr.strip().splitlines()[-4:]
         raise AudioError(" / ".join(tail) or f"{args[0]} failed")
@@ -31,13 +50,31 @@ def probe(path: Path) -> dict:
     data = json.loads(out)
     streams = data.get("streams") or []
     if not streams:
-        raise AudioError(f"{path.name} contains no audio stream")
+        kind = "video" if is_video(path) else "file"
+        raise AudioError(f"This {kind} has no audio track")
     stream = streams[0]
     return {
         "duration_s": float(data.get("format", {}).get("duration") or 0.0),
         "channels": int(stream.get("channels") or 1),
         "sample_rate": int(stream.get("sample_rate") or 0),
     }
+
+
+def extract(src: Path, dst: Path) -> dict:
+    """Pull the first audio track out of any audio or video file as 16 kHz mono.
+
+    Probing first turns "this video has no sound" into a clear message instead
+    of ffmpeg's "Stream map '0:a:0' matches no streams". Returns the probe info
+    of the *source*, whose duration is what the user recognises.
+    """
+    info = probe(src)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    _run([
+        config.FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
+        "-map", "0:a:0", "-vn", "-sn", "-dn",
+        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dst),
+    ])
+    return info
 
 
 def normalize(src: Path, dst: Path) -> Path:

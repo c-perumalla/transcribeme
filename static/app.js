@@ -4,7 +4,7 @@ const $ = (id) => document.getElementById(id);
 const state = {
   sessions: [], skills: [], current: null,
   recordingId: null, stream: null, timerHandle: null, startedAt: 0,
-  provisional: [],
+  provisional: [], platform: "mac", batchId: null, batchTimer: null,
 };
 
 // --- helpers --------------------------------------------------------------
@@ -81,7 +81,8 @@ function renderMarkdown(md) {
 
 async function init() {
   bindTabs();
-  await Promise.all([loadSkills(), loadDevices(), loadSessions()]);
+  try { state.platform = (await api("/api/info")).platform; } catch {}
+  await Promise.all([loadSkills(), loadDevices(), loadSessions(), resumeBatch()]);
 
   $("btn-record").onclick = startRecording;
   $("btn-stop").onclick = stopRecording;
@@ -90,6 +91,9 @@ async function init() {
   $("btn-resummarize").onclick = resummarize;
   $("btn-delete").onclick = deleteSession;
   $("btn-rename").onclick = renameSpeakers;
+  $("btn-batch").onclick = startBatch;
+  $("btn-batch-cancel").onclick = cancelBatch;
+  $("btn-batch-close").onclick = () => { $("batch").hidden = true; stopBatchPolling(); };
 
   setInterval(loadSessions, 4000);
 }
@@ -100,6 +104,7 @@ function bindTabs() {
       document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
       $("tab-record").hidden = tab.dataset.tab !== "record";
       $("tab-upload").hidden = tab.dataset.tab !== "upload";
+      $("tab-folder").hidden = tab.dataset.tab !== "folder";
     };
   });
 }
@@ -108,11 +113,13 @@ async function loadSkills() {
   try {
     const { skills } = await api("/api/skills");
     state.skills = skills;
-    for (const id of ["rec-skill", "up-skill", "detail-skill"]) {
+    for (const id of ["rec-skill", "up-skill", "detail-skill", "batch-skill"]) {
       const sel = $(id);
       sel.innerHTML = skills.map((s) => `<option value="${s.id}">${s.name}</option>`).join("")
         || '<option value="">No skills found</option>';
     }
+    // Summaries cost an API call per file, so a batch defaults to none.
+    $("batch-skill").insertAdjacentHTML("afterbegin", '<option value="" selected>No summary</option>');
   } catch (e) { console.error(e); }
 }
 
@@ -124,9 +131,11 @@ async function loadDevices() {
       .map((d) => `<option value="${d.name}"${d.is_aggregate ? " selected" : ""}>${d.name}</option>`)
       .join("");
     const aggregate = devices.find((d) => d.is_aggregate);
-    $("device-hint").textContent = aggregate
-      ? `Using "${aggregate.name}" — your mic and system audio will be separated into distinct speakers.`
-      : "No Aggregate Device found. Single-device capture works, but system audio won't be captured. See the README to set one up.";
+    $("device-hint").textContent = state.platform === "windows"
+      ? "Records one input. To capture the far end of a call too, route it through VB-Cable or Stereo Mix (see README)."
+      : aggregate
+        ? `Using "${aggregate.name}" — your mic and system audio will be separated into distinct speakers.`
+        : "No Aggregate Device found. Single-device capture works, but system audio won't be captured. See the README to set one up.";
   } catch (e) {
     select.innerHTML = "<option>unavailable</option>";
     $("device-hint").textContent = e.message;
@@ -153,7 +162,7 @@ function renderSessions() {
       <span class="s-meta">${s.created_at.replace("T", " ").slice(0, 16)}
         · ${clock(s.duration_s)}
         ${s.speaker_count ? `· ${s.speaker_count} speakers` : ""}
-        ${s.status === "processing" ? `· ${s.stage || ""}` : ""}
+        ${s.status === "processing" ? `· ${s.queue_position ? `queued #${s.queue_position}` : (s.stage || "")}` : ""}
         ${s.status === "error" ? "· failed" : ""}</span>
     </li>`).join("") || '<li class="muted">Nothing yet.</li>';
 
@@ -215,7 +224,7 @@ async function stopRecording() {
 
 async function uploadFile() {
   const file = $("upload-file").files[0];
-  if (!file) { alert("Pick an audio file first."); return; }
+  if (!file) { alert("Pick an audio or video file first."); return; }
 
   $("btn-upload").disabled = true;
   try {
@@ -368,6 +377,112 @@ async function renameSpeakers() {
   });
   renderTranscript(utterances);
   await loadSessions();
+}
+
+
+// --- folder batch ---------------------------------------------------------
+
+async function startBatch() {
+  const folder = $("batch-folder").value.trim();
+  if (!folder) { alert("Enter a folder path."); return; }
+  $("btn-batch").disabled = true;
+  try {
+    const data = await api("/api/batches", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        folder,
+        recursive: $("batch-recursive").checked,
+        skill: $("batch-skill").value || null,
+        num_speakers: $("batch-speakers").value ? Number($("batch-speakers").value) : null,
+        force: $("batch-force").checked,
+      }),
+    });
+    showBatch(data);
+  } catch (e) {
+    alert(`Could not start batch: ${e.message}`);
+  } finally {
+    $("btn-batch").disabled = false;
+  }
+}
+
+async function resumeBatch() {
+  try {
+    const data = await api("/api/batches/latest");
+    if (data.batch && !data.stats.finished) showBatch(data);
+  } catch (e) { console.error(e); }
+}
+
+function showBatch(data) {
+  state.batchId = data.batch.id;
+  $("batch").hidden = false;
+  renderBatch(data);
+  stopBatchPolling();
+  state.batchTimer = setInterval(pollBatch, 1000);
+}
+
+function stopBatchPolling() {
+  clearInterval(state.batchTimer);
+  state.batchTimer = null;
+}
+
+async function pollBatch() {
+  if (!state.batchId) return;
+  try {
+    const data = await api(`/api/batches/${state.batchId}`);
+    renderBatch(data);
+    if (data.stats.finished) { stopBatchPolling(); loadSessions(); }
+  } catch (e) { console.error(e); }
+}
+
+async function cancelBatch() {
+  if (!state.batchId || !confirm("Cancel the files that haven't started yet? The current file finishes.")) return;
+  renderBatch(await api(`/api/batches/${state.batchId}/cancel`, { method: "POST" }));
+}
+
+const STATUS_LABEL = {
+  queued: "queued", running: "working", done: "done", skipped: "already done",
+  error: "failed", cancelled: "cancelled",
+};
+
+function renderBatch({ batch, stats }) {
+  const c = stats.counts;
+  const finishedCount = (c.done || 0) + (c.error || 0) + (c.skipped || 0) + (c.cancelled || 0);
+  const pct = stats.audio_total_s
+    ? stats.audio_done_s / stats.audio_total_s
+    : finishedCount / Math.max(1, stats.total);
+
+  $("batch-folder-label").textContent = batch.folder;
+  $("batch-bar-fill").style.width = `${Math.round((stats.finished ? 1 : pct) * 100)}%`;
+  $("btn-batch-cancel").hidden = stats.finished;
+
+  const parts = [
+    `<b>${c.done || 0}</b> of ${stats.total - (c.skipped || 0)} transcribed`,
+    c.skipped ? `${c.skipped} already done` : "",
+    c.error ? `<span class="err">${c.error} failed</span>` : "",
+    c.cancelled ? `${c.cancelled} cancelled` : "",
+    `${clock(stats.audio_done_s)} / ${clock(stats.audio_total_s)} of audio`,
+    stats.elapsed_s ? `elapsed ${clock(stats.elapsed_s)}` : "",
+    stats.finished ? "<b>finished</b>"
+      : stats.eta_s != null ? `ETA ${clock(stats.eta_s)}` : "measuring speed…",
+  ];
+  $("batch-summary").innerHTML = parts.filter(Boolean).join(" · ");
+
+  $("batch-rows").innerHTML = batch.items.map((item) => {
+    const progress = item.status === "done" ? 1 : item.status === "running" ? (item.progress || 0) : 0;
+    const stage = item.status === "running" && item.stage ? ` · ${escapeHtml(item.stage)}` : "";
+    const err = item.error ? `<div class="err">${escapeHtml(item.error)}</div>` : "";
+    return `<tr class="${item.status}">
+      <td class="file">${escapeHtml(item.rel_path)}${err}</td>
+      <td class="num">${item.duration_s ? clock(item.duration_s) : "–"}</td>
+      <td><span class="pill ${item.status}">${STATUS_LABEL[item.status] || item.status}</span>${stage}</td>
+      <td><div class="bar"><div class="fill" style="width:${Math.round(progress * 100)}%"></div></div></td>
+      <td>${item.session_id ? `<button class="ghost small" data-open="${item.session_id}">Open</button>` : ""}</td>
+    </tr>`;
+  }).join("");
+  document.querySelectorAll("#batch-rows [data-open]").forEach((b) => {
+    b.onclick = () => openSession(b.dataset.open);
+  });
 }
 
 init();

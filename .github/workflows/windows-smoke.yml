@@ -1,0 +1,58 @@
+# Proves the Windows path end to end on a real Windows machine: setup.ps1
+# (uv, VC++ check, pinned ffmpeg, locked deps), then a folder batch over a
+# generated video. Diarization runs only if the HF_TOKEN secret is configured.
+name: windows-smoke
+
+on:
+  push:
+    branches: [main, build-transcribeme]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PYTHONUTF8: "1"
+      ASR_BACKEND: faster_whisper
+      FASTER_WHISPER_MODEL: tiny
+      HUGGINGFACE_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup (the same script users double-click)
+        shell: pwsh
+        run: |
+          # --offline doctor still fails on a missing HF token; that is
+          # expected on forks without the secret, so don't gate on it here.
+          ./scripts/setup.ps1 -NonInteractive -SkipModels
+          if (-not (Test-Path .tools/ffmpeg/bin/ffmpeg.exe)) { throw "ffmpeg missing" }
+          if (-not (Test-Path .venv)) { throw "venv missing" }
+          exit 0
+
+      - name: Unit tests
+        shell: pwsh
+        run: uv run --frozen pytest -q
+
+      - name: Batch a folder with a video in it
+        shell: pwsh
+        run: |
+          $env:Path = "$PWD\.tools\ffmpeg\bin;$env:Path"
+          New-Item -ItemType Directory -Force "sample folder\nested" | Out-Null
+          ffmpeg -v error -y -f lavfi -i color=c=blue:s=320x240:d=6 `
+            -i tests/fixtures/hello.wav -shortest -ac 2 -c:a aac -c:v mpeg4 `
+            "sample folder\nested\clip one.mp4"
+          if (-not $env:HUGGINGFACE_TOKEN) {
+            # No token: diarization would fail, so stub it to one speaker.
+            $env:TRANSCRIBEME_FAKE_DIARIZATION = "1"
+          }
+          uv run --frozen transcribeme batch "sample folder" --recursive --no-drive --formats md,txt
+          if ($LASTEXITCODE -ne 0) { throw "batch failed" }
+          $txt = Get-Content "sample folder\transcripts\nested\clip one.txt" -Raw
+          Write-Host $txt
+          if ($txt -notmatch "(?i)quick|brown|fox|test") { throw "transcript has no expected words" }
+
+      - name: Device listing does not crash
+        shell: pwsh
+        run: uv run --frozen transcribeme doctor --offline; exit 0
